@@ -1,0 +1,23 @@
+# Build outputs
+build/
+build-*/
+out/
+dist/
+*.o
+*.a
+*.so
+*.so.*
+
+# IDE / Editor
+.vscode/
+.idea/
+.cache/
+compile_commands.json
+*.swp
+*~
+
+# Runtime / Local artifacts
+*.log
+*.tmp
+benchmarks/local-*
+configs/*.local.yaml
