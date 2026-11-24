@@ -48,6 +48,9 @@ DeviceAccess ProbeRegularFile(const std::string& path) {
     return result;
 }
 
+/**
+ * 读取文件第一行并去除首尾空白字符
+ */
 std::optional<std::string> ReadFirstLine(const fs::path& path) {
     std::ifstream in(path);
     std::string line;
@@ -64,6 +67,9 @@ std::optional<std::string> ReadFirstLine(const fs::path& path) {
     return first < last ? std::string(first, last) : std::string{};
 }
 
+/**
+ * 读取文件第一行并严格解析为 64 位整数
+ */
 std::optional<std::int64_t> ReadInteger(const fs::path& path) {
     // 1. 读第一行内容
     const auto line = ReadFirstLine(path);
@@ -81,6 +87,9 @@ std::optional<std::int64_t> ReadInteger(const fs::path& path) {
     return value;
 }
 
+/**
+ * 从 /proc/meminfo 解析系统总内存与可用内存 (单位 MiB)
+ */
 Status ReadMemory(double& total_mib, double& available_mib) {
     // 1. 打开内存文件
     std::ifstream in("/proc/meminfo");
@@ -116,6 +125,9 @@ Status ReadMemory(double& total_mib, double& available_mib) {
     return Status::Ok();
 }
 
+/**
+ * 遍历 /sys/class/thermal 读取各温区类型与温度 (单位 °C) 并按名称排序
+ */
 std::vector<ThermalZone> ReadThermalZone() {
     // 逐文件读取
     // 1. 打开根目录
@@ -151,6 +163,9 @@ std::vector<ThermalZone> ReadThermalZone() {
     return zones;
 }
 
+/**
+ * 按 JSON 规范转义特殊字符并用双引号包裹字符串
+ */
 std::string JsonQuote(const std::string& value) {
     // 给字符串首尾加上引号
     static constexpr char hex[] = "0123456789abcdef";
@@ -192,16 +207,25 @@ std::string JsonQuote(const std::string& value) {
     return out;
 }
 
+/**
+ * 将布尔值转换为 JSON 字符串字面量 ("true" / "false")
+ */
 const char* JsonBool(bool b) {
     return b ? "true" : "false";
 }
 
+/**
+ * 向输出流写入路径的 exists、readable、writable 三个 JSON 字段
+ */
 void WriteAccessFields(std::ostringstream& out, const DeviceAccess& access) {
     out << "\"exists\": " << JsonBool(access.exists)
         << ", \"readable\": " << JsonBool(access.readable)
         << ", \"writable\": " << JsonBool(access.writable);
 }
 
+/**
+ * 向输出流写入可选浮点数, 无值时输出 null
+ */
 void WriteOptionalNumber(std::ostringstream& out, const std::optional<double>& value) {
     if (value) {
         out << *value;
@@ -212,6 +236,9 @@ void WriteOptionalNumber(std::ostringstream& out, const std::optional<double>& v
 
 } // namespace
 
+/**
+ * 采集内存、关键硬件设备节点、温区、NPU 频率及模型文件状态
+ */
 Status SystemProbe::Collect(SystemReport& out, const std::string& model_path) {
     if (model_path.empty()) {
         return Status::InvalidArgument("模型路径不能为空");
@@ -244,6 +271,9 @@ Status SystemProbe::Collect(SystemReport& out, const std::string& model_path) {
     return Status::Ok();
 }
 
+/**
+ * 将系统探测报告序列化为格式化 JSON 字符串
+ */
 std::string SystemReport::to_json() const {
     std::ostringstream out;
     out.imbue(std::locale::classic()); // 强制使用标准 "C" 区域设置,确保小数点永远是 .
