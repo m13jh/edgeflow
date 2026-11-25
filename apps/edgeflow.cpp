@@ -1,3 +1,10 @@
+#include "edgeflow/core/latency_stats.h"
+#include "edgeflow/postprocess/classification.h"
+#include <charconv>
+#include <optional>
+#include <stdexcept>
+#include <system_error>
+#include <vector>
 #if EDGEFLOW_WITH_RKNN
 
 #include "edgeflow/backend/rknn_context.h"
@@ -11,7 +18,6 @@
 #include <cmath>
 #include <iomanip>
 #include <iostream>
-#include <numeric>
 #include <ratio>
 #include <string>
 #include <string_view>
@@ -23,6 +29,31 @@ constexpr int kExitHealthFailed = 1;
 constexpr int kExitUsage = 2;
 constexpr std::string_view kNpuNode = "/dev/dri/renderD129";
 
+struct InferOptions {
+    std::string model_path;
+    std::string input_path;
+    std::size_t warmup = 0;
+    std::size_t runs = 1;
+    std::size_t topk = 5;
+};
+
+/**
+ * 将字符串严格解析为无符号整数, 包含非数字字符、负号或溢出时返回 false
+ */
+bool ParseSize(std::string_view text, std::size_t& out) {
+    if (text.empty()) {
+        return false;
+    }
+    std::size_t value = 0;
+    const char* end = text.data() + text.size();
+    const auto result = std::from_chars(text.data(), end, value);
+    if (result.ec != std::errc{} || result.ptr != end) {
+        return false;
+    }
+    out = value;
+    return true;
+}
+
 /**
  * 打印 edgeflow 命令行帮助信息与退出码说明
  */
@@ -31,13 +62,22 @@ void PrintUsage(std::ostream& os) {
        << "Usage:\n"
        << "  edgeflow version\n"
        << "  edgeflow doctor [--model <path>]\n"
+       << "  edgeflow infer [--model <path>] --input <jpeg>\n"
+       << "                 [--warmup <N>] [--runs <N>] [--topk <K>]\n"
        << "  edgeflow --help\n\n"
        << "Commands:\n"
        << "  version  Show version, commit, build type, architecture, backend flags\n"
-       << "  doctor   Print a JSON device report to stdout\n\n"
+       << "  doctor   Print a JSON device report to stdout\n"
+       << "  infer    Run image classification and report inference latency\n\n"
+       << "Infer options:\n"
+       << "  --model <path>  RKNN model (default: built-in model path)\n"
+       << "  --input <jpeg>  Input JPEG image (required)\n"
+       << "  --warmup <N>    Warmup iterations, N >= 0 (default: 0)\n"
+       << "  --runs <N>      Timed iterations, N >= 1 (default: 1)\n"
+       << "  --topk <K>      Number of predictions, K >= 1 (default: 5)\n\n"
        << "Exit codes:\n"
        << "  0  Success (doctor: required checks passed)\n"
-       << "  1  Probe failure, inaccessible NPU node, or missing/unreadable model\n"
+       << "  1  Probe or inference failure\n"
        << "  2  Invalid command-line arguments\n";
 }
 
@@ -85,6 +125,9 @@ int RunDoctor(const std::string& model_path) {
 
 #if EDGEFLOW_WITH_RKNN
 
+/**
+ * 格式化打印单个 RKNN 输入或输出张量的维度、数据类型、量化参数与内存对齐属性
+ */
 void PrintTensor(const char* kind, const edgeflow::RknnTensorInfo& tensor) {
     std::cout << kind << " index=" << tensor.index << " name=" << tensor.name
               << " dims=[";
@@ -94,10 +137,23 @@ void PrintTensor(const char* kind, const edgeflow::RknnTensorInfo& tensor) {
         }
         std::cout << tensor.dims[i];
     }
-    std::cout << "] fmt=" << tensor.format << " type=" << tensor.type
-              << " size=" << tensor.size << '\n';
+    std::cout << "]"
+              << ", n_elems=" << tensor.n_elems
+              << ", size=" << tensor.size
+              << ", fmt=" << tensor.format
+              << ", type=" << tensor.type
+              << ", qnt_type=" << tensor.qnt_type
+              << ", zp=" << tensor.zp
+              << ", scale=" << tensor.scale
+              << ", fl=" << static_cast<int>(tensor.fl) // fl 为 int8_t 直接输出可能会当成 signed char
+              << ", w_stride=" << tensor.w_stride
+              << ", size_with_stride=" << tensor.size_with_stride
+              << '\n';
 }
 
+/**
+ * 校验解码后的 RGB 图像尺寸与模型单输入张量的批次、通道数及宽高是否匹配
+ */
 bool CheckImageShape(const edgeflow::RknnTensorInfo& input, const edgeflow::RgbImage& image) {
     const auto& dims = input.dims;
     const bool nhwc = input.format == "NHWC";
@@ -118,7 +174,12 @@ bool CheckImageShape(const edgeflow::RknnTensorInfo& input, const edgeflow::RgbI
     return true;
 }
 
-int InferImage(const std::string& model_path, const std::string& input_path) {
+/**
+ * 加载 JPEG 图像与 RKNN 模型, 执行预热与多轮计时推理并输出延迟统计与 Top-K 分类结果
+ */
+int InferImage(const InferOptions& options) {
+    const std::string& input_path = options.input_path;
+    const std::string& model_path = options.model_path;
     // 1. 加载图片
     edgeflow::RgbImage image;
     auto status = edgeflow::LoadJpegRgb24(input_path, image);
@@ -161,52 +222,84 @@ int InferImage(const std::string& model_path, const std::string& input_path) {
     if (!CheckImageShape(ctx.inputs().front(), image)) {
         return kExitHealthFailed;
     }
-    // 5. 执行推理
+    // 5. 准备计时样本和输出容器
+    std::vector<double> samples_ms;
+    try {
+        samples_ms.reserve(options.runs);
+    } catch (const std::length_error&) {
+        std::cerr << "edgeflow infer: too many timed runs\n";
+        return kExitHealthFailed;
+    } catch (const std::bad_alloc&) {
+        std::cerr << "edgeflow infer: cannot allocate latency samples\n";
+        return kExitHealthFailed;
+    }
     std::vector<std::vector<float>> outputs;
-    const auto infer_start = std::chrono::steady_clock::now();
-    status = ctx.RunRgbUint8(image.data.data(), image.data.size(), outputs);
-    const auto infer_time = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - infer_start
-    );
+    // 6. 预热, 不采集耗时样本
+    for (std::size_t i = 0; i < options.warmup; ++i) {
+        outputs.clear();
+        status = ctx.RunRgbUint8(image.data.data(), image.data.size(), outputs);
+        if (!status.ok()) {
+            std::cerr << "edgeflow infer: warmup " << i + 1 << " failed: " << status.message() << '\n';
+            return kExitHealthFailed;
+        }
+    }
+    // 7. 正式计时, 每次调用单独测量
+    for (std::size_t i = 0; i < options.runs; ++i) {
+        outputs.clear();
+        const auto start = std::chrono::steady_clock::now();
+        status = ctx.RunRgbUint8(image.data.data(), image.data.size(), outputs);
+        const auto end = std::chrono::steady_clock::now();
+        if (!status.ok()) {
+            std::cerr << "edgeflow infer: inference failed: " << status.message() << '\n';
+            return kExitHealthFailed;
+        }
+        samples_ms.push_back(std::chrono::duration<double, std::milli>(end - start).count());
+    }
+    // 8. 统计正式推理耗时
+    edgeflow::LatencyStats stats;
+    status = edgeflow::ComputeLatencyStats(samples_ms, stats);
     if (!status.ok()) {
-        std::cerr << "edgeflow infer: inference failed: " << status.message() << '\n';
+        std::cerr << "edgeflow infer: latency statistics failed: " << status.message() << '\n';
         return kExitHealthFailed;
     }
-    std::cout << "RunRgbUint8: " << infer_time.count() << " ms\n";
-    // 6. 打印前 5 条信息
-    // 原本输出为 0: 0.1, 1: 0.9, 2: 0.3, 3: 0.2, 4: 0.01
-    constexpr std::size_t kTop = 5;
-    if (outputs.empty() || outputs.front().size() < kTop) {
-        std::cerr << "edgeflow infer: output[0] must contain at least 5 class scores\n";
+    // 9. 对最后一次正式推理结果进行分类后处理
+    if (outputs.empty()) {
+        std::cerr << "edgeflow infer: model returned no outputs\n";
         return kExitHealthFailed;
     }
-    // 有错误数据直接报错
-    const auto& scores = outputs.front();
-    if (
-        !std::all_of(scores.begin(), scores.end(), [](float s) {
-            // 正常数值返回 true
-            return std::isfinite(s);
-        })
-    ) {
-        // 不能是非有限小数
-        std::cerr << "edgeflow infer: output[0] contains a non-finite class score\n";
+    std::vector<edgeflow::ClassPrediction> predictions;
+    status = edgeflow::TopKPredictions(outputs.front(), options.topk, predictions);
+    if (!status.ok()) {
+        std::cerr << "edgeflow infer: classification postprocess failed: " << status.message() << '\n';
         return kExitHealthFailed;
     }
-    // 不修改原 scores 数组的前提下, 高效找出分数最高的前 kTop 个类别
-    // 排序后, 1: 0.9, 2: 0.3, 3: 0.2, 0: 0.1, 4: 0.01
-    std::vector<std::size_t> order(scores.size());
-    // std::iota 连续递增填充
-    std::iota(order.begin(), order.end(), std::size_t{ 0 });
-    std::partial_sort(order.begin(), order.begin() + kTop, order.end(), [&scores](std::size_t a, std::size_t b) {
-        if (scores[a] == scores[b])
-            return a < b;
-        return scores[a] > scores[b];
-    });
-    std::cout << "---- Top5 ----\n"
+    // 10. 打印耗时统计, 默认单次推理保持原有输出格式
+    if (options.runs == 1) {
+        if (options.warmup != 0) {
+            std::cout << "Warmup: " << options.warmup << '\n';
+        }
+        std::cout << "RunRgbUint8: " << stats.mean_ms << " ms\n";
+    } else {
+        std::cout << "---- RunRgbUint8 latency ----\n"
+                  << "Runs: " << stats.count << '\n'
+                  << "Warmup: " << options.warmup << '\n'
+                  << std::fixed << std::setprecision(3)
+                  << "Min: " << stats.min_ms << " ms\n"
+                  << "Mean: " << stats.mean_ms << " ms\n"
+                  << "P50: " << stats.p50_ms << " ms\n"
+                  << "P95: " << stats.p95_ms << " ms\n"
+                  << "P99: " << stats.p99_ms << " ms\n"
+                  << "Max: " << stats.max_ms << " ms\n"
+                  << "FPS: " << stats.throughput_fps << '\n';
+    }
+    // 11. 打印分类结果
+    std::cout << "---- Top" << predictions.size() << " ----\n"
               << std::fixed << std::setprecision(6);
-    for (std::size_t rank = 0; rank < kTop; ++rank) {
-        const auto index = order[rank];
-        std::cout << scores[index] << " - " << index << '\n';
+    for (const auto& prediction : predictions) {
+        std::cout << prediction.score
+                  << " - "
+                  << prediction.class_id
+                  << '\n';
     }
     return kExitOk;
 }
@@ -214,6 +307,7 @@ int InferImage(const std::string& model_path, const std::string& input_path) {
 #endif
 
 /**
+ * 解析 infer 子命令参数并执行单张图像推理
  * 1. edgeflow infer --model mobilenet_v1.rknn --input dog.jpg
  * 2. edgeflow infer --help
  */
@@ -222,36 +316,61 @@ int RunInfer(int argc, char* argv[]) {
         PrintUsage(std::cout);
         return kExitOk;
     }
-    std::string model_path;
-    std::string input_path;
+    InferOptions options;
+    std::optional<std::size_t> warmup;
+    std::optional<std::size_t> runs;
+    std::optional<std::size_t> topk;
     for (int i = 2; i < argc; ++i) {
         const std::string_view flag(argv[i]);
-        if (flag != "--model" && flag != "--input") {
+        if (flag == "--model" || flag == "--input") {
+            auto& value = (flag == "--model" ? options.model_path : options.input_path);
+            if (!value.empty()) {
+                std::cerr << "edgeflow infer: duplicate option: " << flag << '\n';
+                return kExitUsage;
+            }
+            if (i + 1 == argc || argv[i + 1][0] == '\0' || argv[i + 1][0] == '-') {
+                std::cerr << "edgeflow infer: " << flag << " requires a path\n";
+                return kExitUsage;
+            }
+            value = argv[++i];
+        } else if (flag == "--warmup" || flag == "--runs" || flag == "--topk") {
+            auto& value = (flag == "--warmup" ? warmup : (flag == "--runs" ? runs : topk));
+            if (value.has_value()) {
+                std::cerr << "edgeflow infer: duplicate option: " << flag << '\n';
+                return kExitUsage;
+            }
+            // 后面的 ParseSize 带有严格的字符校验
+            if (i + 1 == argc) {
+                std::cerr << "edgeflow infer: " << flag << " requires an integer\n";
+                return kExitUsage;
+            }
+            std::size_t parsed = 0;
+            // 如果当前选项不是 --warmup, 但解析出来的数字等于 0
+            if (!ParseSize(argv[++i], parsed) || (flag != "--warmup" && parsed == 0)) {
+                std::cerr << "edgeflow infer: " << flag
+                          << (flag == "--warmup" ? " requires an integer >= 0\n"
+                                                 : " requires an integer >= 1\n");
+                return kExitUsage;
+            }
+            value = parsed;
+        } else {
             std::cerr << "edgeflow infer: unknown argument: " << flag << '\n';
             return kExitUsage;
         }
-        // 这里必须为引用
-        auto& value = flag == "--model" ? model_path : input_path;
-        if (!value.empty()) {
-            std::cerr << "edgeflow infer: duplicate option: " << flag << '\n';
-            return kExitUsage;
-        }
-        if (i + 1 == argc || argv[i + 1][0] == '\0' || argv[i + 1][0] == '-') {
-            std::cerr << "edgeflow infer: " << flag << " requires a path\n";
-            return kExitUsage;
-        }
-        value = argv[++i];
     }
-    if (input_path.empty()) {
+    if (options.input_path.empty()) {
         std::cerr << "edgeflow infer: --input <jpeg> is required\n";
         return kExitUsage;
     }
+    options.warmup = warmup.value_or(options.warmup);
+    options.runs = runs.value_or(options.runs);
+    options.topk = topk.value_or(options.topk);
 #if EDGEFLOW_WITH_RKNN
-    if (model_path.empty())
-        model_path = edgeflow::SystemProbe::kDefaultModelPath;
-    return InferImage(model_path, input_path);
+    if (options.model_path.empty()) {
+        options.model_path = edgeflow::SystemProbe::kDefaultModelPath;
+    }
+    return InferImage(options);
 #else
-    (void)model_path; // 忽略未使用警告
     std::cerr << "edgeflow infer: RKNN backend is disabled (EDGEFLOW_WITH_RKNN=OFF)\n";
     return kExitHealthFailed;
 #endif
@@ -260,7 +379,7 @@ int RunInfer(int argc, char* argv[]) {
 } // namespace
 
 /**
- * CLI 入口, 解析命令行参数并分发到 help / version / doctor 子命令
+ * CLI 入口, 解析命令行参数并分发到 help / version / doctor / infer 子命令
  */
 int main(int argc, char* argv[]) {
     if (argc == 1) {

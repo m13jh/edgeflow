@@ -33,6 +33,8 @@ add_library(edgeflow_core STATIC
     src/core/status.cpp
     src/core/system_probe.cpp
     src/core/image_io.cpp
+    src/postprocess/classification.cpp
+    src/core/latency_stats.cpp
 )
 
 target_include_directories(edgeflow_core

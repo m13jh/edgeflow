@@ -22,9 +22,15 @@ struct RknnTensorInfo {
     std::string format;              // Tensor 数据布局, 如 NHWC, NCHW
     std::string type;                // 元素数据类型
     // Xfloat = (Xint - zp) * scale
+    // 量化相关属性
     std::string qnt_type; // 量化类型, 如 qnt_type=AFFINE
-    std::int32_t zp = 0;  // 零点
-    float scale = 0.0f;   // 缩放因子
+    std::int32_t zp = 0;  // AFFINE 零点
+    float scale = 0.0f;   // AFFINE 缩放因子
+    // Xfloat = Xint * 2^-fl
+    std::int8_t fl = 0; // DFP 量化的分数位长
+    // 内存布局相关属性
+    std::uint32_t w_stride = 0;         // 宽度方向的 stride
+    std::uint32_t size_with_stride = 0; // 考虑 stride 后的字节数
 };
 
 class RknnContext final { // final 表示这个类不能被继承
@@ -39,12 +45,24 @@ public:
     Status QuerySdkVersion(RknnSdkVersion& out) const;
     Status RunRgbUint8(const std::uint8_t* input_data, std::size_t input_size, std::vector<std::vector<float>>& outputs);
     void Reset() noexcept;
+
+    /**
+     * 判断当前上下文是否已成功加载 RKNN 模型
+     */
     bool IsLoaded() const noexcept {
         return handle_ != 0;
     }
+
+    /**
+     * 获取已加载模型的所有输入张量属性列表
+     */
     const std::vector<RknnTensorInfo>& inputs() const noexcept {
         return input_attrs_;
     }
+
+    /**
+     * 获取已加载模型的所有输出张量属性列表
+     */
     const std::vector<RknnTensorInfo>& outputs() const noexcept {
         return output_attrs_;
     }
