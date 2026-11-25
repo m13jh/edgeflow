@@ -141,6 +141,11 @@ add_test(
     COMMAND edgeflow_unit_tests
 )
 
+add_test(
+    NAME edgeflow_cli_tests
+    COMMAND /bin/bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_cli.sh" "$<TARGET_FILE:edgeflow>"
+)
+
 if (EDGEFLOW_WITH_RKNN)
     add_executable(edgeflow_rknn_tests
         tests/hardware/test_rknn_context.cpp
