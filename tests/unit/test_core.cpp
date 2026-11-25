@@ -31,6 +31,9 @@ int g_failures = 0;
  */
 class ScopedTempFile {
 public:
+    /**
+     * 在系统临时目录下按标签与进程 PID 创建临时文件并写入字节内容
+     */
     ScopedTempFile(const std::string& tag, const std::vector<std::uint8_t>& bytes) {
         const std::string filename = "edgeflow_test_" + tag + "_" + std::to_string(::getpid()) + ".tmp";
         path_ = (fs::temp_directory_path() / filename).string();
@@ -43,6 +46,9 @@ public:
         }
     }
 
+    /**
+     * 析构时自动移除临时测试文件并忽略删除异常
+     */
     ~ScopedTempFile() noexcept {
         std::error_code ec;
         fs::remove(path_, ec);
@@ -51,6 +57,9 @@ public:
     ScopedTempFile(const ScopedTempFile&) = delete;
     ScopedTempFile& operator=(const ScopedTempFile&) = delete;
 
+    /**
+     * 获取临时测试文件的完整路径
+     */
     const std::string& path() const noexcept {
         return path_;
     }

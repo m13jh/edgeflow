@@ -39,12 +39,24 @@ public:
     Status QuerySdkVersion(RknnSdkVersion& out) const;
     Status RunRgbUint8(const std::uint8_t* input_data, std::size_t input_size, std::vector<std::vector<float>>& outputs);
     void Reset() noexcept;
+
+    /**
+     * 判断当前上下文是否已成功加载 RKNN 模型
+     */
     bool IsLoaded() const noexcept {
         return handle_ != 0;
     }
+
+    /**
+     * 获取已加载模型的所有输入张量属性列表
+     */
     const std::vector<RknnTensorInfo>& inputs() const noexcept {
         return input_attrs_;
     }
+
+    /**
+     * 获取已加载模型的所有输出张量属性列表
+     */
     const std::vector<RknnTensorInfo>& outputs() const noexcept {
         return output_attrs_;
     }

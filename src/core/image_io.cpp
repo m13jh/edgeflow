@@ -12,7 +12,13 @@
 namespace edgeflow {
 namespace {
 
+/**
+ * std::unique_ptr 文件流释放器, 确保离开作用域时自动关闭打开的文件句柄
+ */
 struct FileCloser {
+    /**
+     * 若文件流指针非空则调用 fclose 关闭文件
+     */
     void operator()(std::FILE* file) const noexcept {
         if (file != nullptr) {
             std::fclose(file);
@@ -26,12 +32,18 @@ struct JpegErrorState {
     char message[JMSG_STR_PARM_MAX]{}; // 保存具体的 JPEG 错误文本
 };
 
+/**
+ * libjpeg 致命错误回调, 格式化错误信息并通过 longjmp 跳回调用方以避免默认 exit 终止进程
+ */
 void JpegErrorExit(j_common_ptr info) {
     auto* error = reinterpret_cast<JpegErrorState*>(info->err);
     (*info->err->format_message)(info, error->message); // 调用函数指针
     longjmp(error->jump, 1);
 }
 
+/**
+ * libjpeg 消息回调, 捕获首个损坏数据警告文本并累计警告计数
+ */
 void JpegEmitMessage(j_common_ptr info, int leval) {
     if (leval < 0) {
         auto* error = reinterpret_cast<JpegErrorState*>(info->err);
@@ -42,10 +54,20 @@ void JpegEmitMessage(j_common_ptr info, int leval) {
     }
 }
 
+/**
+ * RAII 守卫, 确保离开作用域时自动销毁 libjpeg 解压状态机并释放内部内存
+ */
 class JpegDestroyGuard {
 public:
+    /**
+     * 构造守卫并绑定待管理的 libjpeg 解压结构体引用
+     */
     explicit JpegDestroyGuard(jpeg_decompress_struct& info) noexcept
         : info_(info) {}
+
+    /**
+     * 析构时调用 jpeg_destroy_decompress 释放 libjpeg 解压资源
+     */
     ~JpegDestroyGuard() noexcept {
         jpeg_destroy_decompress(&info_);
     }
@@ -65,6 +87,9 @@ enum class DecodeResult {
     ShortRead
 };
 
+/**
+ * 读取 JPEG 头信息并校验尺寸与内存上限, 逐行将像素数据解码为 RGB24 格式
+ */
 DecodeResult DecodeJpeg(
     std::FILE* file,
     jpeg_decompress_struct* info,
@@ -132,6 +157,9 @@ DecodeResult DecodeJpeg(
 
 } // namespace
 
+/**
+ * 打开并解码指定路径的 JPEG 文件, 输出按行紧凑存储的 RGB24 图像数据
+ */
 Status LoadJpegRgb24(const std::string& path, RgbImage& out) {
     // 1. 判断图片是否为空
     if (path.empty()) {

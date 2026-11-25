@@ -85,6 +85,9 @@ int RunDoctor(const std::string& model_path) {
 
 #if EDGEFLOW_WITH_RKNN
 
+/**
+ * 格式化打印单个 RKNN 输入或输出张量的索引、名称、维度、布局、数据类型与字节大小
+ */
 void PrintTensor(const char* kind, const edgeflow::RknnTensorInfo& tensor) {
     std::cout << kind << " index=" << tensor.index << " name=" << tensor.name
               << " dims=[";
@@ -98,6 +101,9 @@ void PrintTensor(const char* kind, const edgeflow::RknnTensorInfo& tensor) {
               << " size=" << tensor.size << '\n';
 }
 
+/**
+ * 校验解码后的 RGB 图像尺寸与模型单输入张量的批次、通道数及宽高是否匹配
+ */
 bool CheckImageShape(const edgeflow::RknnTensorInfo& input, const edgeflow::RgbImage& image) {
     const auto& dims = input.dims;
     const bool nhwc = input.format == "NHWC";
@@ -118,6 +124,9 @@ bool CheckImageShape(const edgeflow::RknnTensorInfo& input, const edgeflow::RgbI
     return true;
 }
 
+/**
+ * 加载 JPEG 图像与 RKNN 模型, 执行单次推理并按置信度降序打印 Top-5 分类结果
+ */
 int InferImage(const std::string& model_path, const std::string& input_path) {
     // 1. 加载图片
     edgeflow::RgbImage image;
@@ -214,6 +223,7 @@ int InferImage(const std::string& model_path, const std::string& input_path) {
 #endif
 
 /**
+ * 解析 infer 子命令参数并执行单张图像推理
  * 1. edgeflow infer --model mobilenet_v1.rknn --input dog.jpg
  * 2. edgeflow infer --help
  */
