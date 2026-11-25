@@ -1,10 +1,14 @@
 #include "edgeflow/core/image_io.h"
+#include "edgeflow/core/latency_stats.h"
 #include "edgeflow/core/status.h"
 #include "edgeflow/core/system_probe.h"
+#include "edgeflow/postprocess/classification.h"
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <random>
 #include <string>
 #include <system_error>
 #include <unistd.h>
@@ -270,6 +274,273 @@ void TestLoadJpegRgb24() {
     CHECK(image.data.size() == 2U * 2U * 3U);
 }
 
+/**
+ * 测试 TopKPredictions 的正常排序、边界条件、
+ * 非法输入及同分排序行为
+ */
+void TestTopKPredictions() {
+    std::vector<edgeflow::ClassPrediction> predictions;
+
+    // 1. 正常路径：4 个类别取 Top-2
+    const std::vector<float> scores = {
+        0.1f, 0.9f, 0.3f, 0.5f
+    };
+    const auto normal_status = edgeflow::TopKPredictions(scores, 2, predictions);
+
+    CHECK(normal_status.ok());
+    CHECK(predictions.size() == 2);
+
+    if (predictions.size() == 2) {
+        CHECK(predictions[0].class_id == 1);
+        CHECK(predictions[0].score == 0.9f);
+        CHECK(predictions[1].class_id == 3);
+        CHECK(predictions[1].score == 0.5f);
+    }
+
+    // 验证原始输入没有被修改
+    CHECK((scores == std::vector<float>{ 0.1f, 0.9f, 0.3f, 0.5f }));
+
+    // 2. 空数组 -> InvalidArgument
+    const auto empty_status = edgeflow::TopKPredictions(
+        {}, 2, predictions
+    );
+
+    CHECK(!empty_status.ok());
+    CHECK(empty_status.code() == edgeflow::ErrorCode::InvalidArgument);
+    CHECK(predictions.empty());
+
+    // 3. k = 0 -> InvalidArgument
+    const auto zero_status = edgeflow::TopKPredictions(
+        scores, 0, predictions
+    );
+
+    CHECK(!zero_status.ok());
+    CHECK(zero_status.code() == edgeflow::ErrorCode::InvalidArgument);
+    CHECK(predictions.empty());
+
+    // 4. 包含 NaN -> InvalidArgument
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+
+    const auto nan_status = edgeflow::TopKPredictions(
+        { 0.1f, nan, 0.9f }, 2, predictions
+    );
+
+    CHECK(!nan_status.ok());
+    CHECK(nan_status.code() == edgeflow::ErrorCode::InvalidArgument);
+    CHECK(predictions.empty());
+
+    // 5. 包含正无穷 -> InvalidArgument
+    const float inf = std::numeric_limits<float>::infinity();
+
+    const auto inf_status = edgeflow::TopKPredictions(
+        { 0.1f, inf, 0.9f }, 2, predictions
+    );
+
+    CHECK(!inf_status.ok());
+    CHECK(inf_status.code() == edgeflow::ErrorCode::InvalidArgument);
+    CHECK(predictions.empty());
+
+    // 6. 包含负无穷 -> InvalidArgument
+    const auto neg_inf_status = edgeflow::TopKPredictions(
+        { 0.1f, -inf, 0.9f }, 2, predictions
+    );
+
+    CHECK(!neg_inf_status.ok());
+    CHECK(neg_inf_status.code() == edgeflow::ErrorCode::InvalidArgument);
+    CHECK(predictions.empty());
+
+    // 7. k 大于类别总数：3 个类别取 Top-5
+    const auto oversized_status = edgeflow::TopKPredictions(
+        { 0.3f, 0.9f, 0.5f }, 5, predictions
+    );
+
+    CHECK(oversized_status.ok());
+    CHECK(predictions.size() == 3);
+
+    if (predictions.size() == 3) {
+        CHECK(predictions[0].class_id == 1);
+        CHECK(predictions[0].score == 0.9f);
+        CHECK(predictions[1].class_id == 2);
+        CHECK(predictions[1].score == 0.5f);
+        CHECK(predictions[2].class_id == 0);
+        CHECK(predictions[2].score == 0.3f);
+    }
+
+    // 8. 分数完全相等时，下标小的排在前面
+    const auto tie_status = edgeflow::TopKPredictions(
+        { 0.5f, 0.9f, 0.9f, 0.5f }, 4, predictions
+    );
+
+    CHECK(tie_status.ok());
+    CHECK(predictions.size() == 4);
+
+    if (predictions.size() == 4) {
+        CHECK(predictions[0].class_id == 1);
+        CHECK(predictions[1].class_id == 2);
+        CHECK(predictions[2].class_id == 0);
+        CHECK(predictions[3].class_id == 3);
+    }
+
+    // 9. 同分截断：两个最高分相同，但只取 Top-1
+    const auto cutoff_status = edgeflow::TopKPredictions(
+        { 0.9f, 0.9f, 0.3f }, 1, predictions
+    );
+
+    CHECK(cutoff_status.ok());
+    CHECK(predictions.size() == 1);
+
+    if (predictions.size() == 1) {
+        CHECK(predictions[0].class_id == 0);
+        CHECK(predictions[0].score == 0.9f);
+    }
+}
+
+/**
+ * 测试 ComputeLatencyStats 的基础统计指标、
+ * Nearest-rank 分位数、吞吐量及非法输入校验
+ */
+void TestComputeLatencyStats() {
+    edgeflow::LatencyStats stats;
+
+    // 浮点数比较允许的误差
+    constexpr double kEpsilon = 1e-9;
+
+    // 1. 正常路径：构造乱序的 1.0 到 100.0
+    std::vector<double> samples(100);
+
+    std::iota(samples.begin(), samples.end(), 1.0);
+
+    // 固定随机种子，保证测试可复现
+    std::mt19937 rng(42);
+    std::shuffle(samples.begin(), samples.end(), rng);
+
+    // 保存原始数据
+    const auto original = samples;
+
+    const auto normal_status = edgeflow::ComputeLatencyStats(
+        samples, stats
+    );
+
+    CHECK(normal_status.ok());
+    CHECK(stats.count == 100);
+
+    CHECK(std::abs(stats.min_ms - 1.0) < kEpsilon);
+    CHECK(std::abs(stats.max_ms - 100.0) < kEpsilon);
+    CHECK(std::abs(stats.mean_ms - 50.5) < kEpsilon);
+
+    CHECK(std::abs(stats.p50_ms - 50.0) < kEpsilon);
+    CHECK(std::abs(stats.p95_ms - 95.0) < kEpsilon);
+    CHECK(std::abs(stats.p99_ms - 99.0) < kEpsilon);
+
+    CHECK(
+        std::abs(stats.throughput_fps - 1000.0 / 50.5) < kEpsilon
+    );
+
+    // 验证原始输入顺序没有被修改
+    CHECK(samples == original);
+
+    // 2. 空数组 -> InvalidArgument
+    const auto empty_status = edgeflow::ComputeLatencyStats(
+        {}, stats
+    );
+
+    CHECK(!empty_status.ok());
+    CHECK(empty_status.code() == edgeflow::ErrorCode::InvalidArgument);
+
+    // 验证旧统计结果已经被清空
+    CHECK(stats.count == 0);
+    CHECK(stats.min_ms == 0.0);
+    CHECK(stats.max_ms == 0.0);
+    CHECK(stats.mean_ms == 0.0);
+    CHECK(stats.p50_ms == 0.0);
+    CHECK(stats.p95_ms == 0.0);
+    CHECK(stats.p99_ms == 0.0);
+    CHECK(stats.throughput_fps == 0.0);
+
+    // 3. 单个样本：所有延迟指标均为 6.5
+    const auto single_status = edgeflow::ComputeLatencyStats(
+        { 6.5 }, stats
+    );
+
+    CHECK(single_status.ok());
+    CHECK(stats.count == 1);
+
+    CHECK(std::abs(stats.min_ms - 6.5) < kEpsilon);
+    CHECK(std::abs(stats.max_ms - 6.5) < kEpsilon);
+    CHECK(std::abs(stats.mean_ms - 6.5) < kEpsilon);
+
+    CHECK(std::abs(stats.p50_ms - 6.5) < kEpsilon);
+    CHECK(std::abs(stats.p95_ms - 6.5) < kEpsilon);
+    CHECK(std::abs(stats.p99_ms - 6.5) < kEpsilon);
+
+    CHECK(
+        std::abs(stats.throughput_fps - 1000.0 / 6.5) < kEpsilon
+    );
+
+    // 4. 包含负数 -> InvalidArgument
+    const auto negative_status = edgeflow::ComputeLatencyStats(
+        { -1.0 }, stats
+    );
+
+    CHECK(!negative_status.ok());
+    CHECK(negative_status.code() == edgeflow::ErrorCode::InvalidArgument);
+    CHECK(stats.count == 0);
+
+    // 5. 包含 NaN -> InvalidArgument
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+
+    const auto nan_status = edgeflow::ComputeLatencyStats(
+        { 1.0, nan, 3.0 }, stats
+    );
+
+    CHECK(!nan_status.ok());
+    CHECK(nan_status.code() == edgeflow::ErrorCode::InvalidArgument);
+
+    // 6. 包含正无穷 -> InvalidArgument
+    const double inf = std::numeric_limits<double>::infinity();
+
+    const auto inf_status = edgeflow::ComputeLatencyStats(
+        { 1.0, inf, 3.0 }, stats
+    );
+
+    CHECK(!inf_status.ok());
+    CHECK(inf_status.code() == edgeflow::ErrorCode::InvalidArgument);
+
+    // 7. 包含负无穷 -> InvalidArgument
+    const auto neg_inf_status = edgeflow::ComputeLatencyStats(
+        { 1.0, -inf, 3.0 }, stats
+    );
+
+    CHECK(!neg_inf_status.ok());
+    CHECK(neg_inf_status.code() == edgeflow::ErrorCode::InvalidArgument);
+
+    // 8. 所有样本均为 0，避免计算 FPS 时出现除零
+    const auto zero_status = edgeflow::ComputeLatencyStats(
+        { 0.0, 0.0, 0.0 }, stats
+    );
+
+    CHECK(zero_status.ok());
+    CHECK(stats.count == 3);
+    CHECK(stats.min_ms == 0.0);
+    CHECK(stats.max_ms == 0.0);
+    CHECK(stats.mean_ms == 0.0);
+    CHECK(stats.p50_ms == 0.0);
+    CHECK(stats.p95_ms == 0.0);
+    CHECK(stats.p99_ms == 0.0);
+    CHECK(stats.throughput_fps == 0.0);
+
+    // 9. 偶数样本：验证 Nearest-rank 分位数计算
+    const auto even_status = edgeflow::ComputeLatencyStats(
+        { 40.0, 10.0, 30.0, 20.0 }, stats
+    );
+
+    CHECK(even_status.ok());
+    CHECK(stats.count == 4);
+    CHECK(std::abs(stats.mean_ms - 25.0) < kEpsilon);
+    CHECK(std::abs(stats.p50_ms - 20.0) < kEpsilon);
+    CHECK(std::abs(stats.p95_ms - 40.0) < kEpsilon);
+    CHECK(std::abs(stats.p99_ms - 40.0) < kEpsilon);
+}
 } // namespace
 
 /**
@@ -280,6 +551,8 @@ int main() {
     TestSystemProbeModelChecks();
     TestSystemReportToJson();
     TestLoadJpegRgb24();
+    TestTopKPredictions();
+    TestComputeLatencyStats();
 
     if (g_failures == 0) {
         std::cout << "[PASS] all edgeflow_unit_tests passed\n";

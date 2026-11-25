@@ -180,9 +180,14 @@ RknnTensorInfo ConvertTensorAttr(const rknn_tensor_attr& attr) {
     result.size = attr.size;
     result.format = TensorFormatName(attr.fmt);
     result.type = TensorTypeName(attr.type);
+    // 量化相关属性
     result.qnt_type = QuantizationName(attr.qnt_type);
     result.zp = attr.zp;
     result.scale = attr.scale;
+    result.fl = attr.fl;
+    // 内存布局相关属性
+    result.w_stride = attr.w_stride;
+    result.size_with_stride = attr.size_with_stride;
     return result;
 }
 
