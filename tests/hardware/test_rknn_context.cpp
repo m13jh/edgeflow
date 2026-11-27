@@ -1,4 +1,6 @@
+#include "edgeflow/backend/rknn_backend.h"
 #include "edgeflow/backend/rknn_context.h"
+#include "edgeflow/backend/tensor.h"
 #include "edgeflow/core/image_io.h"
 #include "edgeflow/core/status.h"
 #include "edgeflow/core/system_probe.h"
@@ -300,6 +302,139 @@ void TestInferenceValidationAndAccuracy() {
     }
 }
 
+/** 无需真实 NPU 或模型的 RknnBackend 参数校验。 */
+void TestRknnBackendErrorPaths() {
+    using namespace edgeflow;
+    RknnBackend backend;
+    CHECK(!backend.IsLoaded());
+    CHECK(backend.InputDescs().empty());
+    CHECK(backend.OutputDescs().empty());
+    CHECK(backend.Capabilities().backend_name == "rknn");
+    std::vector<Tensor> inputs, outputs;
+    CHECK(backend.Run(inputs, outputs).code() == ErrorCode::RuntimeError);
+    CHECK(backend.Run(inputs, inputs).code() == ErrorCode::InvalidArgument);
+    ModelConfig config;
+    CHECK(backend.Load(config).code() == ErrorCode::InvalidArgument);
+    config.model_path = "/tmp/edgeflow_unloaded_backend_model.rknn";
+    config.expected_sha256 = std::string(64, 'a');
+    CHECK(backend.Load(config).code() == ErrorCode::Unsupported);
+    config.expected_sha256.clear();
+    config.backend_options["threads"] = "4";
+    CHECK(backend.Load(config).code() == ErrorCode::InvalidArgument);
+    config.backend_options.clear();
+    config.backend_options["core_mask"] = "99";
+    CHECK(backend.Load(config).code() == ErrorCode::InvalidArgument);
+    CHECK(!backend.IsLoaded());
+    CHECK(backend.InputDescs().empty());
+    CHECK(backend.OutputDescs().empty());
+}
+
+/** 通过 IInferenceBackend 验证真实 MobileNetV1 推理及失败重载后的可用性。 */
+void TestRknnBackendMobileNetInference() {
+    using namespace edgeflow;
+    RknnBackend backend;
+    IInferenceBackend& iface = backend;
+    ModelConfig config;
+    config.model_path = SystemProbe::kDefaultModelPath;
+    config.backend_options["core_mask"] = "auto";
+    const auto load = iface.Load(config);
+    CHECK(load.ok());
+    if (!load.ok())
+        return;
+    CHECK(iface.IsLoaded());
+    CHECK(iface.InputDescs().size() == 1);
+    CHECK(iface.OutputDescs().size() == 1);
+    if (iface.InputDescs().size() != 1 || iface.OutputDescs().size() != 1)
+        return;
+    const std::vector<std::uint32_t> expected_input{ 1, 224, 224, 3 };
+    const std::vector<std::uint32_t> expected_output{ 1, 1001 };
+    const auto input_desc = iface.InputDescs().front();
+    const auto output_desc = iface.OutputDescs().front();
+    CHECK(input_desc.dims == expected_input);
+    CHECK(input_desc.dtype == DataType::UInt8);
+    CHECK(input_desc.fmt == TensorFormat::NHWC);
+    CHECK(output_desc.dims == expected_output);
+    CHECK(output_desc.dtype == DataType::Float32);
+
+    ModelConfig missing = config;
+    missing.model_path = "/tmp/edgeflow_rknn_backend_reload_missing_99999.rknn";
+    CHECK(iface.Load(missing).code() == ErrorCode::NotFound);
+    CHECK(backend.IsLoaded());
+    CHECK(iface.InputDescs().size() == 1);
+    CHECK(iface.OutputDescs().size() == 1);
+    if (!backend.IsLoaded() || iface.InputDescs().size() != 1 || iface.OutputDescs().size() != 1)
+        return;
+    CHECK(iface.InputDescs().front().dims == input_desc.dims);
+    CHECK(iface.OutputDescs().front().dims == output_desc.dims);
+
+    std::vector<Tensor> inputs, outputs;
+    Tensor wrong;
+    const auto bad_alloc = Tensor::Allocate(
+        { "images", { 1, 100, 100, 3 }, DataType::UInt8, TensorFormat::NHWC }, wrong
+    );
+    CHECK(bad_alloc.ok());
+    if (!bad_alloc.ok())
+        return;
+    inputs.push_back(std::move(wrong));
+    CHECK(iface.Run(inputs, outputs).code() == ErrorCode::InvalidArgument);
+    inputs.clear();
+
+    std::error_code ec;
+    if (!fs::is_regular_file(kDogImagePath, ec) || ec) {
+        std::cout << "[SKIP] RknnBackend sample image not found: " << kDogImagePath << '\n';
+        return;
+    }
+    RgbImage dog;
+    const auto image_status = LoadJpegRgb24(kDogImagePath, dog);
+    CHECK(image_status.ok());
+    if (!image_status.ok())
+        return;
+    CHECK(dog.width == 224);
+    CHECK(dog.height == 224);
+    CHECK(dog.channels == 3);
+    CHECK(dog.data.size() == 224U * 224U * 3U);
+    if (dog.width != 224 || dog.height != 224 || dog.channels != 3 ||
+        dog.data.size() != 224U * 224U * 3U)
+        return;
+    Tensor image;
+    const auto copy = Tensor::FromBytes(
+        { input_desc.name, { 1, 224, 224, 3 }, DataType::UInt8, TensorFormat::NHWC },
+        dog.data.data(),
+        dog.data.size(),
+        image
+    );
+    CHECK(copy.ok());
+    if (!copy.ok())
+        return;
+    inputs.push_back(std::move(image));
+    const auto run = iface.Run(inputs, outputs);
+    CHECK(run.ok());
+    if (!run.ok())
+        return;
+    CHECK(outputs.size() == 1);
+    if (outputs.size() != 1)
+        return;
+    const auto& output = outputs.front();
+    CHECK(output.Validate().ok());
+    CHECK(output.Desc().dims == expected_output);
+    CHECK(output.Desc().dtype == DataType::Float32);
+    CHECK(output.Desc().NumElements() == 1001);
+    CHECK(output.SizeBytes() == 1001U * sizeof(float));
+    const float* scores = output.Data<float>();
+    CHECK(scores != nullptr);
+    if (!scores || output.SizeBytes() != 1001U * sizeof(float))
+        return;
+    const bool finite = std::all_of(scores, scores + 1001, [](float v) {
+        return std::isfinite(v);
+    });
+    CHECK(finite);
+    if (!finite)
+        return;
+    const auto* best = std::max_element(scores, scores + 1001);
+    CHECK(static_cast<std::size_t>(best - scores) == 156U);
+    CHECK(*best > 0.90f);
+}
+
 } // namespace
 
 /**
@@ -308,10 +443,12 @@ void TestInferenceValidationAndAccuracy() {
 int main() {
     TestEmptyContextLifecycle();
     TestLoadFromFileErrorPaths();
+    TestRknnBackendErrorPaths();
 
     if (HasBoardNpuAndModel()) {
         TestBoardModelLifecycleAndMoveSemantics();
         TestInferenceValidationAndAccuracy();
+        TestRknnBackendMobileNetInference();
     } else {
         std::cout << "[SKIP] NPU device or default RKNN model unavailable; "
                      "skipped on-board hardware checks\n";

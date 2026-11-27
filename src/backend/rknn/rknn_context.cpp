@@ -1,4 +1,5 @@
 #include "edgeflow/backend/rknn_context.h"
+#include "edgeflow/backend/tensor.h"
 #include "edgeflow/core/status.h"
 #include "rknn_api.h"
 #include <algorithm>
@@ -298,6 +299,172 @@ private:
     bool armed_ = true;    // 标记是否还需要执行释放操作
 };
 
+/**
+ * 将 EdgeFlow 的通用 DataType 转换成 RKNN SDK 的数据类型
+ * todo 目前只写了两个类型, 后面可以继续增加
+ */
+Status MapInputType(DataType dtype, rknn_tensor_type& out) {
+    switch (dtype) {
+    case DataType::UInt8:
+        out = RKNN_TENSOR_UINT8;
+        break;
+    case DataType::Float32:
+        out = RKNN_TENSOR_FLOAT32;
+        break;
+    default:
+        return Status::Unsupported("RKNN unsupported input dtype: " + std::string(DataTypeName(dtype)));
+    }
+    return Status::Ok();
+}
+
+/**
+ * 将 EdgeFlow 的张量布局转换为 RKNN 布局
+ */
+Status MapInputFormat(TensorFormat fmt, rknn_tensor_format& out) {
+    switch (fmt) {
+    case TensorFormat::NHWC:
+        out = RKNN_TENSOR_NHWC;
+        break;
+    case TensorFormat::NCHW:
+        out = RKNN_TENSOR_NCHW;
+        break;
+    case TensorFormat::NC1HWC2:
+        out = RKNN_TENSOR_NC1HWC2;
+        break;
+    default:
+        return Status::Unsupported("RKNN unsupported input format: " + std::string(TensorFormatName(fmt)));
+    }
+    return Status::Ok();
+}
+
+/**
+ * 字符串转为对应枚举, 因为 RknnTensorInfo 中的 format 是 string
+ * 而 TensorDesc 中的 fmt 是枚举类型
+ */
+TensorFormat MapFormat(std::string_view format) noexcept {
+    if (format == "NCHW") {
+        return TensorFormat::NCHW;
+    }
+    if (format == "NHWC") {
+        return TensorFormat::NHWC;
+    }
+    if (format == "NC1HWC2") {
+        return TensorFormat::NC1HWC2;
+    }
+    return TensorFormat::Undefined;
+}
+
+/**
+ * 校验 Tensor 输入形状
+ */
+bool InputShapeMatches(const TensorDesc& desc, const RknnTensorInfo& attr) {
+    const auto model_fmt = MapFormat(attr.format);
+    // 1. 相同布局, 直接比较维度
+    if (desc.fmt == model_fmt) {
+        return desc.dims == attr.dims;
+    }
+    // 2. 不同布局时, 当前只支持四维图像张量转换
+    if (desc.dims.size() != 4 || attr.dims.size() != 4) {
+        return false;
+    }
+    const auto& a = desc.dims;
+    const auto& b = attr.dims;
+    // 3. 应用层 NHWC, 模型 NCHW
+    if (desc.fmt == TensorFormat::NHWC &&
+        model_fmt == TensorFormat::NCHW) {
+        return a[0] == b[0] &&
+               a[1] == b[2] &&
+               a[2] == b[3] &&
+               a[3] == b[1];
+    }
+    // 4. 应用层 NCHW, 模型 NHWC
+    if (desc.fmt == TensorFormat::NCHW &&
+        model_fmt == TensorFormat::NHWC) {
+        return a[0] == b[0] &&
+               a[1] == b[3] &&
+               a[2] == b[1] &&
+               a[3] == b[2];
+    }
+    return false;
+}
+
+/**
+ * 公共推理逻辑接口, 输入数据 inputs, 输出结果, 数据处理方式 consume
+ */
+template <typename OutputConsumer>
+Status RunWithInputs(
+    rknn_context ctx,
+    rknn_input* inputs,
+    std::uint32_t input_count,
+    const std::vector<RknnTensorInfo>& output_attrs,
+    OutputConsumer&& consume
+) {
+    if (output_attrs.empty() || output_attrs.size() > std::numeric_limits<std::uint32_t>::max()) {
+        return Status::RuntimeError("Invalid RKNN output tensor count");
+    }
+    // 1. 提前准备输出描述数组
+    std::vector<rknn_output> raw_outputs(output_attrs.size());
+    for (std::size_t i = 0; i < raw_outputs.size(); ++i) {
+        raw_outputs[i].index = static_cast<std::uint32_t>(i);
+        raw_outputs[i].want_float = 1;  // 输出 float 类型
+        raw_outputs[i].is_prealloc = 0; // 自动分配内存
+    }
+    const auto count = static_cast<std::uint32_t>(raw_outputs.size());
+    // 2. 设置所有输入
+    int ret = rknn_inputs_set(ctx, input_count, inputs);
+    if (ret != RKNN_SUCC) {
+        return MapRknnError(ret, "rknn_inputs_set");
+    }
+    // 3. 执行 rknn_run
+    ret = rknn_run(ctx, nullptr);
+    if (ret != RKNN_SUCC) {
+        return MapRknnError(ret, "rknn_run");
+    }
+    // 4. 获取输出
+    ret = rknn_outputs_get(ctx, count, raw_outputs.data(), nullptr);
+    const bool any_buffer = std::any_of(raw_outputs.begin(), raw_outputs.end(), [](const rknn_output& item) {
+        return item.buf != nullptr;
+    });
+    // RAII 管理资源, rknn_outputs_get 要配合 rknn_outputs_release 使用
+    // ret == RKNN_SUCC || any_buffer, rknn_outputs_get 成功或者部分成功
+    OutputReleaseGuard guard(ctx, count, raw_outputs.data(), ret == RKNN_SUCC || any_buffer);
+    if (ret != RKNN_SUCC) {
+        return MapRknnError(ret, "rknn_outputs_get");
+    }
+    // 5. 检查并处理每个输出
+    for (std::size_t i = 0; i < raw_outputs.size(); ++i) {
+        const RknnTensorInfo& attr = output_attrs[i];
+        const rknn_output& raw = raw_outputs[i];
+        // 不为 0, 不能超出 uint32_t 表示范围
+        if (
+            attr.n_elems == 0 ||
+            attr.n_elems > std::numeric_limits<std::uint32_t>::max() / sizeof(float)
+        ) {
+            return Status::RuntimeError("RunWithInputs: invalid element count for output " + std::to_string(i));
+        }
+        const std::size_t expected_bytes = static_cast<std::size_t>(attr.n_elems) * sizeof(float);
+        if (raw.buf == nullptr || raw.size != expected_bytes) {
+            return Status::RuntimeError(
+                "RunWithInputs: invalid float output " + std::to_string(i) +
+                ": expected " + std::to_string(expected_bytes) +
+                " bytes, got " + std::to_string(raw.size) +
+                (raw.buf == nullptr ? " (null buffer)" : "")
+            );
+        }
+        // 由调用者决定如何保存输出
+        Status status = consume(attr, raw);
+        if (!status.ok()) {
+            return status;
+        }
+    }
+    // 6. 这里不是重复释放, 而是检查是否释放成功
+    const int release_ret = guard.Release();
+    if (release_ret != RKNN_SUCC) {
+        return MapRknnError(release_ret, "rknn_outputs_release");
+    }
+    return Status::Ok();
+}
+
 } // namespace
 
 /**
@@ -445,6 +612,7 @@ Status RknnContext::QuerySdkVersion(RknnSdkVersion& out) const {
 
 /**
  * 使用单路 NHWC 格式的 RGB uint8 输入执行一次 RKNN 推理, 并以 float 数组返回所有输出张量
+ * todo 可以用 RunTensors, RunWithInputs 替换接口, 这里暂时先不实现
  */
 Status RknnContext::RunRgbUint8(
     const std::uint8_t* input_data,
@@ -465,21 +633,18 @@ Status RknnContext::RunRgbUint8(
     if (input_data == nullptr) {
         return Status::InvalidArgument("RunRgbUint8: input_data is null");
     }
-    // TODO: 当前同时校验 input_size == size 与 input_size == n_elems, 会拦截 FP16/FP32 等非 1 字节输入的模型
-    //       (pass_through=0 + RKNN_TENSOR_UINT8 时输入缓冲区期望大小应按 n_elems 校验);
-    //       且下方 input_size > uint32_t::max() 位于与 uint32_t 成员比较之后属于死代码, 后续需调整顺序或精简。
-    if (input_size != input_attrs_[0].size) {
+    // tocheck 上限与非空校验
+    if (input_size == 0 || input_size > std::numeric_limits<std::uint32_t>::max()) {
+        return Status::InvalidArgument("RunRgbUint8: invalid input size");
+    }
+    const std::size_t expected_bytes = static_cast<std::size_t>(input_attrs_[0].n_elems) * sizeof(std::uint8_t);
+    if (input_size != expected_bytes) {
         return Status::InvalidArgument(
             "RunRgbUint8: input size mismatch: got " +
-            std::to_string(input_size) + ", expected " +
-            std::to_string(input_attrs_[0].size)
+            std::to_string(input_size) +
+            ", expected " +
+            std::to_string(expected_bytes)
         );
-    }
-    if (input_size == 0 || input_size != input_attrs_[0].n_elems) {
-        return Status::InvalidArgument("RunRgbUint8 requires a tightly packed 1-byte-per-element input");
-    }
-    if (input_size > std::numeric_limits<std::uint32_t>::max()) {
-        return Status::InvalidArgument("RunRgbUint8: input exceeds RKNN size limit");
     }
     if (output_attrs_.empty() || output_attrs_.size() > std::numeric_limits<std::uint32_t>::max()) {
         return Status::RuntimeError("RunRgbUint8: invalid output tensor count");
@@ -560,6 +725,152 @@ Status RknnContext::RunRgbUint8(
     } catch (const std::length_error& e) {
         return Status::RuntimeError("RunRgbUint8: allocation failed: " + std::string(e.what()));
     }
+}
+
+/**
+ * 多个输入 inputs, 多个输出 outputs
+ */
+Status RknnContext::RunTensors(
+    const std::vector<Tensor>& inputs,
+    std::vector<Tensor>& outputs
+) {
+    // 1. 检查模型是否加载
+    if (!IsLoaded()) {
+        return Status::RuntimeError("RunTensors: RKNN model is not loaded");
+    }
+    // 2. 检查输入数量
+    if (inputs.empty() || inputs.size() != input_attrs_.size() || inputs.size() > std::numeric_limits<std::uint32_t>::max()) {
+        return Status::InvalidArgument(
+            "RunTensors: input tensor count mismatch"
+        );
+    }
+    try {
+        // 3. 创建 RKNN 输入数组
+        std::vector<rknn_input> raw_inputs(inputs.size());
+        for (std::size_t i = 0; i < inputs.size(); ++i) {
+            const Tensor& tensor = inputs[i];
+            const RknnTensorInfo& attr = input_attrs_[i];
+            const TensorDesc& desc = tensor.Desc();
+            // 3.1 检查 Tensor 自身是否合法
+            Status status = tensor.Validate();
+            if (!status.ok()) {
+                return status;
+            }
+            // 3.2 检查实际数据大小
+            const std::size_t bytes = tensor.SizeBytes();
+            if (bytes == 0 || bytes > std::numeric_limits<std::uint32_t>::max()) {
+                return Status::InvalidArgument("RunTensors: invalid input byte size");
+            }
+            // 3.3 检查元素数量
+            if (desc.NumElements() != attr.n_elems) {
+                return Status::InvalidArgument("RunTensors: input element count mismatch");
+            }
+            // 3.4 转换输入类型
+            rknn_tensor_type type{};
+            status = MapInputType(desc.dtype, type);
+            if (!status.ok()) {
+                return status;
+            }
+            // 3.5 转换输入布局
+            rknn_tensor_format fmt{};
+            status = MapInputFormat(desc.fmt, fmt);
+            if (!status.ok()) {
+                return status;
+            }
+            // 3.6 检查逻辑形状
+            if (!InputShapeMatches(desc, attr)) {
+                return Status::InvalidArgument("RunTensors: input shape mismatch, index=" + std::to_string(i));
+            }
+            // 3.7 填充 RKNN 输入结构体
+            rknn_input& input = raw_inputs[i];
+            input.index = attr.index;
+            input.buf = const_cast<void*>(tensor.RawData());
+            input.size = static_cast<std::uint32_t>(bytes);
+            input.pass_through = 0;
+            input.type = type;
+            input.fmt = fmt;
+        }
+        // 4. 临时输出容器
+        std::vector<Tensor> new_outputs;
+        new_outputs.reserve(output_attrs_.size());
+        const auto ctx = static_cast<rknn_context>(handle_);
+        // 5. 调用公共推理逻辑
+        Status status = RunWithInputs(
+            ctx,
+            raw_inputs.data(),
+            static_cast<std::uint32_t>(raw_inputs.size()),
+            output_attrs_,
+            [&new_outputs](const RknnTensorInfo& attr, const rknn_output& raw) -> Status {
+                // 构造通用输出张量描述
+                TensorDesc desc{
+                    attr.name,
+                    attr.dims,
+                    DataType::Float32,
+                    MapFormat(attr.format)
+                };
+                // 当前阶段不支持分块输出布局
+                if (desc.fmt == TensorFormat::NC1HWC2) {
+                    return Status::Unsupported("NC1HWC2 output is not supported");
+                }
+                // 未知布局不能冒充普通紧凑张量
+                if (desc.fmt == TensorFormat::Undefined && attr.format != "UNDEFINED") {
+                    return Status::Unsupported("Unknown RKNN output format");
+                }
+                // 检查描述信息与实际输出是否一致
+                if (desc.NumElements() != attr.n_elems || desc.ByteSize() != raw.size) {
+                    return Status::RuntimeError("RunTensors: invalid output descriptor");
+                }
+                // 将 SDK 输出复制到独立 Tensor
+                Tensor tensor;
+                Status status = Tensor::FromBytes(desc, raw.buf, raw.size, tensor);
+                if (!status.ok()) {
+                    return status;
+                }
+                new_outputs.push_back(std::move(tensor));
+                return Status::Ok();
+            }
+        );
+        if (!status.ok()) {
+            return status;
+        }
+        // 6. 全部成功后才提交结果
+        outputs = std::move(new_outputs);
+        return Status::Ok();
+    } catch (const std::bad_alloc&) {
+        return Status::RuntimeError("RunTensors: out of memory");
+    } catch (const std::length_error& e) {
+        return Status::RuntimeError("RunTensors: allocation failed: " + std::string(e.what()));
+    }
+}
+
+/**
+ * 设置 NPU 核心运行模式
+ */
+Status RknnContext::SetCoreMask(std::string_view core_mask) {
+    if (!IsLoaded()) {
+        return Status::RuntimeError("SetCoreMask: RKNN model is not loaded");
+    }
+    rknn_core_mask mask = RKNN_NPU_CORE_AUTO;
+    if (core_mask == "auto") {
+        mask = RKNN_NPU_CORE_AUTO;
+    } else if (core_mask == "core0") {
+        mask = RKNN_NPU_CORE_0;
+    } else if (core_mask == "core1") {
+        mask = RKNN_NPU_CORE_1;
+    } else if (core_mask == "core2") {
+        mask = RKNN_NPU_CORE_2;
+    } else if (core_mask == "core0_1") {
+        mask = RKNN_NPU_CORE_0_1;
+    } else if (core_mask == "core0_1_2") {
+        mask = RKNN_NPU_CORE_0_1_2;
+    } else {
+        return Status::InvalidArgument("Invalid RKNN core_mask: " + std::string(core_mask));
+    }
+    const int ret = rknn_set_core_mask(static_cast<rknn_context>(handle_), mask);
+    if (ret != RKNN_SUCC) {
+        return MapRknnError(ret, "rknn_set_core_mask");
+    }
+    return Status::Ok();
 }
 
 } // namespace edgeflow

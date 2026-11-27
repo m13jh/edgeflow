@@ -1,3 +1,4 @@
+#include "edgeflow/backend/inference_backend.h"
 #include "edgeflow/core/latency_stats.h"
 #include "edgeflow/postprocess/classification.h"
 #include <charconv>
@@ -7,6 +8,7 @@
 #include <vector>
 #if EDGEFLOW_WITH_RKNN
 
+#include "edgeflow/backend/rknn_backend.h"
 #include "edgeflow/backend/rknn_context.h"
 
 #endif
@@ -68,13 +70,13 @@ void PrintUsage(std::ostream& os) {
        << "Commands:\n"
        << "  version  Show version, commit, build type, architecture, backend flags\n"
        << "  doctor   Print a JSON device report to stdout\n"
-       << "  infer    Run image classification and report inference latency\n\n"
+       << "  infer    Run image inference and report latency\n\n"
        << "Infer options:\n"
        << "  --model <path>  RKNN model (default: built-in model path)\n"
        << "  --input <jpeg>  Input JPEG image (required)\n"
        << "  --warmup <N>    Warmup iterations, N >= 0 (default: 0)\n"
        << "  --runs <N>      Timed iterations, N >= 1 (default: 1)\n"
-       << "  --topk <K>      Number of predictions, K >= 1 (default: 5)\n\n"
+       << "  --topk <K>      Number of predictions for single output, K >= 1 (default: 5)\n\n"
        << "Exit codes:\n"
        << "  0  Success (doctor: required checks passed)\n"
        << "  1  Probe or inference failure\n"
@@ -154,10 +156,10 @@ void PrintTensor(const char* kind, const edgeflow::RknnTensorInfo& tensor) {
 /**
  * 校验解码后的 RGB 图像尺寸与模型单输入张量的批次、通道数及宽高是否匹配
  */
-bool CheckImageShape(const edgeflow::RknnTensorInfo& input, const edgeflow::RgbImage& image) {
+bool CheckImageShape(const edgeflow::TensorDesc& input, const edgeflow::RgbImage& image) {
     const auto& dims = input.dims;
-    const bool nhwc = input.format == "NHWC";
-    if ((!nhwc && input.format != "NCHW") || dims.size() != 4 ||
+    const bool nhwc = (input.fmt == edgeflow::TensorFormat::NHWC);
+    if ((!nhwc && input.fmt != edgeflow::TensorFormat::NCHW) || dims.size() != 4 ||
         dims[0] != 1 || dims[nhwc ? 3 : 1] != 3) {
         std::cerr << "edgeflow infer: expected a single RGB image tensor "
                      "with batch=1 and 3 channels (NHWC or NCHW)\n";
@@ -175,7 +177,39 @@ bool CheckImageShape(const edgeflow::RknnTensorInfo& input, const edgeflow::RgbI
 }
 
 /**
- * 加载 JPEG 图像与 RKNN 模型, 执行预热与多轮计时推理并输出延迟统计与 Top-K 分类结果
+ * 打印应用层实际返回的 Float32 输出张量摘要 (调用前已校验)
+ */
+void PrintOutputSummary(std::size_t index, const edgeflow::Tensor& tensor) {
+    const auto& desc = tensor.Desc();
+    const auto count = desc.NumElements();
+    const auto* values = tensor.Data<float>();
+    std::cout << "output_tensor index=" << index
+              << " name=" << desc.name << " dims=[";
+    for (std::size_t i = 0; i < desc.dims.size(); ++i) {
+        if (i != 0) {
+            std::cout << ", ";
+        }
+        std::cout << desc.dims[i];
+    }
+    std::cout << "]" << ", n_elems=" << count
+              << ", dtype=" << edgeflow::DataTypeName(desc.dtype)
+              << ", fmt=" << edgeflow::TensorFormatName(desc.fmt)
+              << ", first_values=[";
+    const auto preview_count = std::min(count, std::size_t{ 5 });
+    for (std::size_t j = 0; j < preview_count; ++j) {
+        if (j != 0) {
+            std::cout << ", ";
+        }
+        std::cout << values[j];
+    }
+    if (count > preview_count) {
+        std::cout << ", ...";
+    }
+    std::cout << "]\n";
+}
+
+/**
+ * 加载 JPEG 图像与 RKNN 模型, 执行预热与多轮计时推理并输出延迟统计与结果
  */
 int InferImage(const InferOptions& options) {
     const std::string& input_path = options.input_path;
@@ -188,9 +222,11 @@ int InferImage(const InferOptions& options) {
         return kExitHealthFailed;
     }
     // 2. 加载模型
-    edgeflow::RknnContext ctx;
+    edgeflow::RknnBackend backend;
+    edgeflow::ModelConfig config;
+    config.model_path = model_path;
     const auto load_start = std::chrono::steady_clock::now(); // ns
-    status = ctx.LoadFromFile(model_path);
+    status = backend.Load(config);
     const auto load_time = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - load_start
     );
@@ -200,7 +236,7 @@ int InferImage(const InferOptions& options) {
     }
     // 3. 查询 rknn sdk 版本
     edgeflow::RknnSdkVersion version;
-    status = ctx.QuerySdkVersion(version);
+    status = backend.QuerySdkVersion(version);
     if (!status.ok()) {
         std::cerr << "edgeflow infer: querying SDK version: " << status.message() << '\n';
         return kExitHealthFailed;
@@ -209,35 +245,52 @@ int InferImage(const InferOptions& options) {
               << "RKNN SDK: " << version.api_version
               << "\nDriver: " << version.drv_version << '\n';
     // 4. 输出 Tensor 数据
-    for (const auto& tensor : ctx.inputs()) {
+    for (const auto& tensor : backend.raw_context().inputs()) {
         PrintTensor("input", tensor);
     }
-    for (const auto& tensor : ctx.outputs()) {
+    for (const auto& tensor : backend.raw_context().outputs()) {
         PrintTensor("output", tensor);
     }
-    if (ctx.inputs().size() != 1) {
-        std::cerr << "edgeflow infer: expected 1 input tensor, got " << ctx.inputs().size() << '\n';
+    const auto& input_descs = backend.InputDescs();
+    if (input_descs.size() != 1) {
+        std::cerr << "edgeflow infer: expected 1 input tensor, got " << input_descs.size() << '\n';
         return kExitHealthFailed;
     }
-    if (!CheckImageShape(ctx.inputs().front(), image)) {
+    if (!CheckImageShape(input_descs.front(), image)) {
         return kExitHealthFailed;
     }
     // 5. 准备计时样本和输出容器
+    // 在计时循环外将 JPEG 字节封装为通用 Tensor，并改用 Tensor 列表作为输入/输出容器
+    // JPEG 解码结果实际为紧凑 NHWC UInt8, 不使用模型原生量化类型
+    std::vector<edgeflow::Tensor> inputs;
+    std::vector<edgeflow::Tensor> output_tensors;
     std::vector<double> samples_ms;
     try {
+        // 构造 NHWC UInt8 输入描述, 并通过 Tensor::FromBytes 拷贝图像像素
+        edgeflow::TensorDesc input_desc{
+            input_descs.front().name,
+            { 1, static_cast<std::uint32_t>(image.height), static_cast<std::uint32_t>(image.width), 3 },
+            edgeflow::DataType::UInt8,
+            edgeflow::TensorFormat::NHWC
+        };
+        inputs.emplace_back();
+        status = edgeflow::Tensor::FromBytes(input_desc, image.data.data(), image.data.size(), inputs.back());
+        if (!status.ok()) {
+            std::cerr << "edgeflow infer: creating input tensor: " << status.message() << '\n';
+            return kExitHealthFailed;
+        }
         samples_ms.reserve(options.runs);
     } catch (const std::length_error&) {
-        std::cerr << "edgeflow infer: too many timed runs\n";
+        std::cerr << "edgeflow infer: invalid input or latency allocation size\n";
         return kExitHealthFailed;
     } catch (const std::bad_alloc&) {
-        std::cerr << "edgeflow infer: cannot allocate latency samples\n";
+        std::cerr << "edgeflow infer: cannot allocate input or latency samples\n";
         return kExitHealthFailed;
     }
-    std::vector<std::vector<float>> outputs;
     // 6. 预热, 不采集耗时样本
     for (std::size_t i = 0; i < options.warmup; ++i) {
-        outputs.clear();
-        status = ctx.RunRgbUint8(image.data.data(), image.data.size(), outputs);
+        output_tensors.clear();
+        status = backend.Run(inputs, output_tensors);
         if (!status.ok()) {
             std::cerr << "edgeflow infer: warmup " << i + 1 << " failed: " << status.message() << '\n';
             return kExitHealthFailed;
@@ -245,9 +298,9 @@ int InferImage(const InferOptions& options) {
     }
     // 7. 正式计时, 每次调用单独测量
     for (std::size_t i = 0; i < options.runs; ++i) {
-        outputs.clear();
+        output_tensors.clear();
         const auto start = std::chrono::steady_clock::now();
-        status = ctx.RunRgbUint8(image.data.data(), image.data.size(), outputs);
+        status = backend.Run(inputs, output_tensors);
         const auto end = std::chrono::steady_clock::now();
         if (!status.ok()) {
             std::cerr << "edgeflow infer: inference failed: " << status.message() << '\n';
@@ -263,15 +316,40 @@ int InferImage(const InferOptions& options) {
         return kExitHealthFailed;
     }
     // 9. 对最后一次正式推理结果进行分类后处理
-    if (outputs.empty()) {
+    if (output_tensors.empty()) {
         std::cerr << "edgeflow infer: model returned no outputs\n";
         return kExitHealthFailed;
     }
+    // 逐个校验输出张量是否为非空有效的 Float32 数据
+    for (std::size_t i = 0; i < output_tensors.size(); ++i) {
+        if (output_tensors[i].Data<float>() == nullptr || output_tensors[i].Desc().NumElements() == 0) {
+            std::cerr << "edgeflow infer: invalid Float32 output at index " << i << '\n';
+            return kExitHealthFailed;
+        }
+    }
     std::vector<edgeflow::ClassPrediction> predictions;
-    status = edgeflow::TopKPredictions(outputs.front(), options.topk, predictions);
-    if (!status.ok()) {
-        std::cerr << "edgeflow infer: classification postprocess failed: " << status.message() << '\n';
-        return kExitHealthFailed;
+    // 单输出分支: 从 Tensor 拷贝出 std::vector<float>
+    // 兼容原有 TopKPredictions 接口, 并捕获内存异常
+    if (output_tensors.size() == 1) {
+        const auto& tensor = output_tensors.front();
+        const auto* values = tensor.Data<float>();
+        const auto count = tensor.Desc().NumElements();
+        try {
+            // 兼容原有 vector<float> 分类接口, 此拷贝不计入推理耗时。
+            const std::vector<float> scores(values, values + count);
+            status = edgeflow::TopKPredictions(scores, options.topk, predictions);
+            if (!status.ok()) {
+                std::cerr << "edgeflow infer: classification postprocess failed: "
+                          << status.message() << '\n';
+                return kExitHealthFailed;
+            }
+        } catch (const std::length_error&) {
+            std::cerr << "edgeflow infer: classification output is too large\n";
+            return kExitHealthFailed;
+        } catch (const std::bad_alloc&) {
+            std::cerr << "edgeflow infer: cannot allocate classification results\n";
+            return kExitHealthFailed;
+        }
     }
     // 10. 打印耗时统计, 默认单次推理保持原有输出格式
     if (options.runs == 1) {
@@ -293,13 +371,22 @@ int InferImage(const InferOptions& options) {
                   << "FPS: " << stats.throughput_fps << '\n';
     }
     // 11. 打印分类结果
-    std::cout << "---- Top" << predictions.size() << " ----\n"
-              << std::fixed << std::setprecision(6);
-    for (const auto& prediction : predictions) {
-        std::cout << prediction.score
-                  << " - "
-                  << prediction.class_id
-                  << '\n';
+    if (output_tensors.size() == 1) {
+        std::cout << "---- Top" << predictions.size() << " ----\n"
+                  << std::fixed << std::setprecision(6);
+        for (const auto& prediction : predictions) {
+            std::cout << prediction.score
+                      << " - "
+                      << prediction.class_id
+                      << '\n';
+        }
+    } else {
+        // 多输出张量摘要打印分支
+        std::cout << "---- Output tensors (" << output_tensors.size() << ") ----\n"
+                  << std::fixed << std::setprecision(6);
+        for (std::size_t i = 0; i < output_tensors.size(); ++i) {
+            PrintOutputSummary(i, output_tensors[i]);
+        }
     }
     return kExitOk;
 }

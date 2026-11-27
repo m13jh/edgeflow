@@ -1,17 +1,25 @@
+#include "edgeflow/backend/mock_backend.h"
+#include "edgeflow/backend/tensor.h"
 #include "edgeflow/core/image_io.h"
 #include "edgeflow/core/latency_stats.h"
 #include "edgeflow/core/status.h"
 #include "edgeflow/core/system_probe.h"
 #include "edgeflow/postprocess/classification.h"
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
+#include <limits>
+#include <memory>
+#include <numeric>
 #include <random>
 #include <string>
 #include <system_error>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -541,6 +549,353 @@ void TestComputeLatencyStats() {
     CHECK(std::abs(stats.p95_ms - 40.0) < kEpsilon);
     CHECK(std::abs(stats.p99_ms - 40.0) < kEpsilon);
 }
+/** 测试张量描述、分配、类型安全、布尔字节校验及移动语义。 */
+void TestTensorDescAndAllocation() {
+    using namespace edgeflow;
+    const TensorDesc desc{ "x", { 1, 2, 3 }, DataType::Float32, TensorFormat::NCHW };
+    CHECK(desc.NumElements() == 6);
+    CHECK(desc.ByteSize() == 24);
+
+    const auto max_dim = std::numeric_limits<std::uint32_t>::max();
+    const TensorDesc empty{ "empty", {}, DataType::Float32, TensorFormat::NCHW };
+    const TensorDesc zero{ "zero", { 1, 0, 3 }, DataType::Float32, TensorFormat::NCHW };
+    const TensorDesc unknown{ "unknown", { 1, 2, 3 }, DataType::Unknown, TensorFormat::NCHW };
+    const TensorDesc elem_overflow{ "overflow", { max_dim, max_dim, max_dim }, DataType::UInt8, TensorFormat::Undefined };
+    const TensorDesc byte_overflow{ "overflow", { max_dim, max_dim }, DataType::Float32, TensorFormat::Undefined };
+    CHECK(empty.NumElements() == 0);
+    CHECK(zero.NumElements() == 0);
+    CHECK(unknown.NumElements() == 6);
+    CHECK(elem_overflow.NumElements() == 0);
+    if constexpr (sizeof(std::size_t) == 8) {
+        CHECK(byte_overflow.NumElements() != 0);
+    }
+    for (const auto& bad : { empty, zero, unknown, elem_overflow, byte_overflow }) {
+        CHECK(bad.ByteSize() == 0);
+        Tensor tensor;
+        CHECK(Tensor::Allocate(bad, tensor).code() == ErrorCode::InvalidArgument);
+    }
+
+    Tensor src;
+    CHECK(src.Validate().code() == ErrorCode::InvalidArgument);
+    CHECK(src.SizeBytes() == 0);
+    CHECK(src.Data<float>() == nullptr);
+    const auto allocated = Tensor::Allocate(desc, src);
+    CHECK(allocated.ok());
+    if (!allocated.ok())
+        return;
+    CHECK(src.Validate().ok());
+    CHECK(src.SizeBytes() == 24);
+    auto* writable = src.MutableData<float>();
+    CHECK(writable != nullptr);
+    if (!writable)
+        return;
+    const float values[] = { 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f };
+    std::copy(std::begin(values), std::end(values), writable);
+    const auto* readable = src.Data<float>();
+    CHECK(readable != nullptr);
+    if (readable)
+        CHECK(std::equal(std::begin(values), std::end(values), readable));
+    CHECK(src.Data<std::uint8_t>() == nullptr);
+    CHECK(src.MutableData<std::uint8_t>() == nullptr);
+
+    Tensor copied;
+    CHECK(Tensor::FromBytes(desc, nullptr, sizeof(values), copied).code() == ErrorCode::InvalidArgument);
+    CHECK(Tensor::FromBytes(desc, values, sizeof(values) - 1, copied).code() == ErrorCode::InvalidArgument);
+    const auto copy_status = Tensor::FromBytes(desc, values, sizeof(values), copied);
+    CHECK(copy_status.ok());
+    if (copy_status.ok()) {
+        const auto* data = copied.Data<float>();
+        CHECK(data != nullptr);
+        if (data)
+            CHECK(std::equal(std::begin(values), std::end(values), data));
+        CHECK(copied.RawData() != static_cast<const void*>(values));
+    }
+
+    const TensorDesc bool_desc{ "flags", { 2 }, DataType::Bool, TensorFormat::Undefined };
+    const std::uint8_t valid_bool[] = { 0, 1 };
+    const std::uint8_t invalid_bool[] = { 0, 2 };
+    Tensor flags;
+    const auto bool_status = Tensor::FromBytes(bool_desc, valid_bool, sizeof(valid_bool), flags);
+    CHECK(bool_status.ok());
+    if (bool_status.ok()) {
+        const auto* data = flags.Data<bool>();
+        CHECK(data != nullptr);
+        if (data) {
+            CHECK(!data[0]);
+            CHECK(data[1]);
+        }
+    }
+    CHECK(Tensor::FromBytes(bool_desc, invalid_bool, sizeof(invalid_bool), flags).code() == ErrorCode::InvalidArgument);
+
+    Tensor moved(std::move(src));
+    CHECK(src.SizeBytes() == 0);
+    CHECK(src.RawData() == nullptr);
+    CHECK(!src.Validate().ok());
+    CHECK(moved.Validate().ok());
+    CHECK(moved.SizeBytes() == sizeof(values));
+    const auto* moved_data = moved.Data<float>();
+    CHECK(moved_data != nullptr);
+    if (moved_data)
+        CHECK(std::equal(std::begin(values), std::end(values), moved_data));
+}
+
+// Tensor 不可拷贝：先分配，再移动到 vector 中。
+bool AppendAllocatedTensor(const edgeflow::TensorDesc& desc, std::vector<edgeflow::Tensor>& tensors) {
+    edgeflow::Tensor tensor;
+    const auto status = edgeflow::Tensor::Allocate(desc, tensor);
+    CHECK(status.ok());
+    if (!status.ok())
+        return false;
+    tensors.push_back(std::move(tensor));
+    return true;
+}
+
+/** 测试 MockBackend 生命周期、加载参数及输入契约。 */
+void TestMockBackendLifecycleAndErrorPaths() {
+    using namespace edgeflow;
+    MockBackend backend;
+    std::vector<Tensor> inputs, outputs;
+    CHECK(!backend.IsLoaded());
+    CHECK(backend.Run(inputs, outputs).code() == ErrorCode::RuntimeError);
+
+    ModelConfig config;
+    CHECK(backend.Load(config).code() == ErrorCode::InvalidArgument);
+    config.model_path = "virtual/mock.rknn";
+    config.expected_sha256 = std::string(64, 'a');
+    CHECK(backend.Load(config).code() == ErrorCode::Unsupported);
+    config.expected_sha256.clear();
+
+    const auto check_option = [&](const char* key, const char* value) {
+        ModelConfig bad = config;
+        bad.backend_options[key] = value;
+        CHECK(backend.Load(bad).code() == ErrorCode::InvalidArgument);
+        CHECK(!backend.IsLoaded());
+    };
+    check_option("unknown", "1");
+    check_option("num_outputs", "0");
+    check_option("num_outputs", "65");
+    check_option("num_outputs", "abc");
+    check_option("fail_run", "yes");
+
+    MockBackendSpec file_spec;
+    file_spec.check_model_file_exists = true;
+    MockBackend file_backend(file_spec);
+    ScopedTempFile model("mock_model", { 1, 2, 3 });
+    ModelConfig file_config;
+    // 使用不存在的同级路径，避免 ENOTDIR 与 NotFound 混淆。
+    file_config.model_path = model.path() + ".missing";
+    CHECK(file_backend.Load(file_config).code() == ErrorCode::NotFound);
+    file_config.model_path = "/tmp";
+    CHECK(file_backend.Load(file_config).code() == ErrorCode::InvalidArgument);
+    file_config.model_path = model.path();
+    CHECK(file_backend.Load(file_config).ok());
+    CHECK(file_backend.IsLoaded());
+
+    const auto load = backend.Load(config);
+    CHECK(load.ok());
+    if (!load.ok())
+        return;
+    CHECK(backend.IsLoaded());
+    CHECK(backend.InputDescs().size() == 1);
+    if (backend.InputDescs().size() != 1)
+        return;
+    const auto expected = backend.InputDescs().front();
+    CHECK(backend.Run(inputs, outputs).code() == ErrorCode::InvalidArgument);
+    if (!AppendAllocatedTensor(expected, inputs))
+        return;
+    CHECK(backend.Run(inputs, inputs).code() == ErrorCode::InvalidArgument);
+    CHECK(inputs.size() == 1);
+    if (inputs.size() != 1)
+        return;
+    CHECK(inputs.front().Validate().ok());
+    if (!AppendAllocatedTensor(expected, inputs))
+        return;
+    CHECK(backend.Run(inputs, outputs).code() == ErrorCode::InvalidArgument);
+    inputs.clear();
+
+    // 分别只修改 shape、dtype、format；防止一种错误掩盖另一种错误。
+    const TensorDesc wrong_descs[] = {
+        { expected.name, { 1, 112, 448, 3 }, DataType::UInt8, TensorFormat::NHWC },
+        { expected.name, expected.dims, DataType::Float32, TensorFormat::NHWC },
+        { expected.name, expected.dims, DataType::UInt8, TensorFormat::NCHW }
+    };
+    for (const auto& wrong : wrong_descs) {
+        if (!AppendAllocatedTensor(wrong, inputs))
+            return;
+        CHECK(backend.Run(inputs, outputs).code() == ErrorCode::InvalidArgument);
+        CHECK(backend.run_count() == 0);
+        inputs.clear();
+    }
+    inputs.emplace_back(); // 未初始化的 Tensor
+    CHECK(backend.Run(inputs, outputs).code() == ErrorCode::InvalidArgument);
+    CHECK(backend.run_count() == 0);
+    inputs.clear();
+
+    if (!AppendAllocatedTensor(expected, inputs))
+        return;
+    CHECK(backend.Run(inputs, outputs).ok());
+    CHECK(backend.run_count() == 1);
+    backend.Reset();
+    backend.Reset(); // Reset 应当幂等
+    CHECK(!backend.IsLoaded());
+    CHECK(backend.InputDescs().empty());
+    CHECK(backend.OutputDescs().empty());
+    CHECK(backend.run_count() == 0);
+    CHECK(backend.Run(inputs, outputs).code() == ErrorCode::RuntimeError);
+}
+
+/** 测试失败 Load 不破坏旧状态以及两种故障注入方式。 */
+void TestMockBackendFaultInjectionAndStrongGuarantee() {
+    using namespace edgeflow;
+    MockBackend backend;
+    ModelConfig config;
+    config.model_path = "virtual/mock.rknn";
+    const auto load = backend.Load(config);
+    CHECK(load.ok());
+    if (!load.ok())
+        return;
+    CHECK(backend.InputDescs().size() == 1);
+    if (backend.InputDescs().size() != 1)
+        return;
+    std::vector<Tensor> inputs, outputs;
+    if (!AppendAllocatedTensor(backend.InputDescs().front(), inputs))
+        return;
+    const auto run = backend.Run(inputs, outputs);
+    CHECK(run.ok());
+    if (!run.ok())
+        return;
+    CHECK(backend.run_count() == 1);
+    CHECK(!outputs.empty());
+
+    ModelConfig bad = config;
+    bad.model_path.clear();
+    CHECK(backend.Load(bad).code() == ErrorCode::InvalidArgument);
+    CHECK(backend.IsLoaded());
+    CHECK(backend.InputDescs().size() == 1);
+    CHECK(backend.OutputDescs().size() == 1);
+    CHECK(backend.run_count() == 1);
+    CHECK(backend.Run(inputs, outputs).ok());
+    CHECK(backend.run_count() == 2);
+
+    ModelConfig fail = config;
+    fail.backend_options["fail_run"] = "true";
+    const auto fail_load = backend.Load(fail);
+    CHECK(fail_load.ok());
+    if (!fail_load.ok())
+        return;
+    outputs.clear();
+    if (!AppendAllocatedTensor({ "stale", { 1 }, DataType::Float32, TensorFormat::Undefined }, outputs))
+        return;
+    CHECK(backend.Run(inputs, outputs).code() == ErrorCode::RuntimeError);
+    CHECK(outputs.empty());
+    CHECK(backend.run_count() == 0);
+
+    MockBackendSpec load_spec;
+    load_spec.forced_load_status = Status::PermissionDenied("injected load error");
+    MockBackend load_backend(load_spec);
+    const auto injected_load = load_backend.Load(config);
+    CHECK(injected_load.code() == ErrorCode::PermissionDenied);
+    CHECK(injected_load.message() == "injected load error");
+    CHECK(!load_backend.IsLoaded());
+
+    MockBackendSpec run_spec;
+    run_spec.forced_run_status = Status::IoError("injected run error");
+    MockBackend run_backend(run_spec);
+    const auto run_load = run_backend.Load(config);
+    CHECK(run_load.ok());
+    if (!run_load.ok())
+        return;
+    if (!AppendAllocatedTensor({ "stale", { 1 }, DataType::Float32, TensorFormat::Undefined }, outputs))
+        return;
+    const auto injected_run = run_backend.Run(inputs, outputs);
+    CHECK(injected_run.code() == ErrorCode::IoError);
+    CHECK(injected_run.message() == "injected run error");
+    CHECK(outputs.empty());
+    CHECK(run_backend.run_count() == 0);
+}
+
+/** 通过统一接口模拟三输出检测模型，并检查所有元素的确定性。 */
+void TestMockBackendMultiOutputPolymorphism() {
+    using namespace edgeflow;
+    MockBackendSpec spec;
+    spec.input_descs = { { "images", { 1, 640, 640, 3 }, DataType::UInt8, TensorFormat::NHWC } };
+    spec.output_descs = {
+        { "head_80", { 1, 84, 80, 80 }, DataType::Float32, TensorFormat::NCHW },
+        { "head_40", { 1, 84, 40, 40 }, DataType::Float32, TensorFormat::NCHW },
+        { "head_20", { 1, 84, 20, 20 }, DataType::Float32, TensorFormat::NCHW }
+    };
+    std::unique_ptr<IInferenceBackend> backend = std::make_unique<MockBackend>(spec);
+    CHECK(backend->Capabilities().backend_name == "mock");
+    CHECK(backend->Capabilities().supports_multi_output);
+    ModelConfig config;
+    config.model_path = "virtual/yolov8.rknn";
+    const auto load = backend->Load(config);
+    CHECK(load.ok());
+    if (!load.ok())
+        return;
+    CHECK(backend->InputDescs().size() == 1);
+    CHECK(backend->OutputDescs().size() == 3);
+    std::vector<Tensor> inputs, outputs, again;
+    if (!AppendAllocatedTensor(spec.input_descs.front(), inputs))
+        return;
+    auto* pixels = inputs.front().MutableData<std::uint8_t>();
+    CHECK(pixels != nullptr);
+    if (!pixels)
+        return;
+    pixels[0] = 42;
+    const auto first = backend->Run(inputs, outputs);
+    const auto second = backend->Run(inputs, again);
+    CHECK(first.ok());
+    CHECK(second.ok());
+    if (!first.ok() || !second.ok())
+        return;
+    CHECK(outputs.size() == 3);
+    CHECK(again.size() == 3);
+    if (outputs.size() != 3 || again.size() != 3)
+        return;
+    for (std::size_t i = 0; i < spec.output_descs.size(); ++i) {
+        const auto& expected = spec.output_descs[i];
+        const auto& a = outputs[i];
+        const auto& b = again[i];
+        CHECK(a.Validate().ok());
+        CHECK(b.Validate().ok());
+        CHECK(a.Desc().dims == expected.dims);
+        CHECK(b.Desc().dims == expected.dims);
+        CHECK(a.Desc().dtype == DataType::Float32);
+        CHECK(b.Desc().dtype == DataType::Float32);
+        CHECK(a.Desc().fmt == expected.fmt);
+        CHECK(b.Desc().fmt == expected.fmt);
+        CHECK(a.SizeBytes() == expected.ByteSize());
+        CHECK(b.SizeBytes() == expected.ByteSize());
+        const auto* pa = a.Data<float>();
+        const auto* pb = b.Data<float>();
+        CHECK(pa != nullptr);
+        CHECK(pb != nullptr);
+        if (!pa || !pb || a.SizeBytes() != expected.ByteSize() || b.SizeBytes() != expected.ByteSize())
+            continue;
+        const auto n = expected.NumElements();
+        CHECK(std::all_of(pa, pa + n, [](float x) {
+            return std::isfinite(x);
+        }));
+        CHECK(std::all_of(pb, pb + n, [](float x) {
+            return std::isfinite(x);
+        }));
+        CHECK(std::equal(pa, pa + n, pb));
+    }
+    // 用默认只有一个输出的 Mock，确保覆盖选项真的改变了数量。
+    MockBackend dynamic_backend;
+    const auto base_load = dynamic_backend.Load(config);
+    CHECK(base_load.ok());
+    if (!base_load.ok())
+        return;
+    CHECK(dynamic_backend.OutputDescs().size() == 1);
+    config.backend_options["num_outputs"] = "3";
+    const auto dynamic_load = dynamic_backend.Load(config);
+    CHECK(dynamic_load.ok());
+    if (dynamic_load.ok())
+        CHECK(dynamic_backend.OutputDescs().size() == 3);
+}
+
 } // namespace
 
 /**
@@ -553,6 +908,10 @@ int main() {
     TestLoadJpegRgb24();
     TestTopKPredictions();
     TestComputeLatencyStats();
+    TestTensorDescAndAllocation();
+    TestMockBackendLifecycleAndErrorPaths();
+    TestMockBackendFaultInjectionAndStrongGuarantee();
+    TestMockBackendMultiOutputPolymorphism();
 
     if (g_failures == 0) {
         std::cout << "[PASS] all edgeflow_unit_tests passed\n";

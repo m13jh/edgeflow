@@ -35,6 +35,8 @@ add_library(edgeflow_core STATIC
     src/core/image_io.cpp
     src/postprocess/classification.cpp
     src/core/latency_stats.cpp
+    src/backend/tensor.cpp
+    src/backend/mock/mock_backend.cpp
 )
 
 target_include_directories(edgeflow_core
@@ -86,6 +88,7 @@ if (EDGEFLOW_WITH_RKNN)
 
     add_library(edgeflow_rknn STATIC
         src/backend/rknn/rknn_context.cpp
+        src/backend/rknn/rknn_backend.cpp
     )
 
     # SDK 头文件只对 RKNN 目标可见

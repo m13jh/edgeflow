@@ -1,8 +1,10 @@
 #pragma once
 
+#include "edgeflow/backend/tensor.h"
 #include "edgeflow/core/status.h"
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace edgeflow {
@@ -45,6 +47,10 @@ public:
     Status QuerySdkVersion(RknnSdkVersion& out) const;
     Status RunRgbUint8(const std::uint8_t* input_data, std::size_t input_size, std::vector<std::vector<float>>& outputs);
     void Reset() noexcept;
+    // 通用推理接口，支持多输入和多输出
+    Status RunTensors(const std::vector<Tensor>& inputs, std::vector<Tensor>& outputs);
+    // 设置 NPU 核心运行模式
+    Status SetCoreMask(std::string_view core_mask);
 
     /**
      * 判断当前上下文是否已成功加载 RKNN 模型
